@@ -1,125 +1,230 @@
-﻿using System.IO.Compression;
+using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
+
 namespace WTFile
 {
     internal class Program
     {
-        static void Main(string[] args)
+        // Upper limit on how many bytes of a file to read, even if a signature
+        // asks for more. The signature list's deepest entry starts around byte 29000.
+        const int MaxBytesToRead = 64 * 1024;
+
+        static int Main(string[] args)
         {
             try
             {
-                // Check if a file path is provided as a command-line argument
                 if (args.Length == 0)
                 {
-                    Console.WriteLine("Please provide a file path as a command-line argument.");
-                    return;
+                    Console.Error.WriteLine("Please provide a file path as a command-line argument.");
+                    return 1;
                 }
 
-                // Get the file path from the command-line arguments
                 string filePath = args[0];
-                // Path to the JSON file containing file signatures
-                string magicNumbers = "C:\\Users\\Tim\\source\\repos\\WTFile\\WTFile\\file_sigs.json";
-                // Read the JSON content from the file
-                string jsonContent = File.ReadAllText(magicNumbers);
 
-                // Read the first 64 bytes of the specified file (to ensure we have enough bytes for comparison)
-                byte[] fileBytes = new byte[64];
-                using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+                if (!File.Exists(filePath))
                 {
-                    fs.ReadExactly(fileBytes);
+                    Console.Error.WriteLine($"File not found: {filePath}");
+                    return 1;
                 }
 
-                // Convert the bytes to a hex string
-                StringBuilder hex = new StringBuilder(fileBytes.Length * 2);
-                foreach (byte b in fileBytes)
+                // The signature list ships next to the executable.
+                string signaturesPath = Path.Combine(AppContext.BaseDirectory, "file_sigs.json");
+                if (!File.Exists(signaturesPath))
                 {
-                    hex.AppendFormat("{0:x2}", b);
+                    Console.Error.WriteLine($"Signature file not found: {signaturesPath}");
+                    return 1;
                 }
-                string fileHex = hex.ToString();
 
-                // Parse the JSON content
-                using (JsonDocument document = JsonDocument.Parse(jsonContent))
+                string jsonContent = File.ReadAllText(signaturesPath);
+
+                // Read only as much of the file as the deepest signature needs.
+                int bytesToRead = Math.Min(LargestOffsetPlusSignature(jsonContent), MaxBytesToRead);
+                string fileHex = ReadFileStartAsHex(filePath, bytesToRead);
+
+                List<(string Description, string Extension, string Signature)> matches =
+                    FindMatchingSignatures(jsonContent, fileHex, filePath);
+
+                if (matches.Count == 0)
                 {
-                    JsonElement root = document.RootElement;
-                    JsonElement fileSigs = root.GetProperty("filesigs");
-                    bool matchFound = false;
-
-                    // Iterate through each file signature in the JSON array
-                    foreach (JsonElement fileSig in fileSigs.EnumerateArray())
-                    {
-                        if (fileSig.TryGetProperty("Header (hex)", out JsonElement headerHexElement) &&
-                            fileSig.TryGetProperty("Header offset", out JsonElement headerOffsetElement) &&
-                            fileSig.TryGetProperty("File description", out JsonElement descriptionElement) &&
-                            fileSig.TryGetProperty("File extension", out JsonElement extensionElement))
-                        {
-                            string sig = headerHexElement.GetString()?.Replace(" ", "").ToLower() ?? string.Empty;
-                            int offset = int.TryParse(headerOffsetElement.GetString(), out int parsedOffset) ? parsedOffset : 0;
-
-                            // Ensure we have enough bytes to compare
-                            if (fileHex.Length >= (offset * 2 + sig.Length))
-                            {
-                                // Compare the file's hex string with the signature at the specified offset
-                                if (fileHex.Substring(offset * 2, sig.Length) == sig)
-                                {
-                                    // If a match is found, retrieve and print the file description and extension
-                                    string description = descriptionElement.GetString() ?? "Unknown";
-                                    string extension = extensionElement.GetString() ?? "Unknown";
-
-                                    // Additional check for DOCX files
-                                    if (extension.Contains("ZIP") && IsDocxFile(filePath))
-                                    {
-                                        description = "Microsoft Office Open XML Format Document";
-                                        extension = "DOCX";
-                                    }
-
-                                    Console.WriteLine($"The file signature {sig} matches the file {filePath} with description '{description}' and extension '{extension}'");
-                                    matchFound = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // If no match is found, print a message and the file's hex signature
-                    if (!matchFound)
-                    {
-                        Console.WriteLine("No matching file signature found.");
-                        Console.WriteLine($"File signature: {fileHex}");
-                    }
+                    Console.WriteLine("No matching file signature found.");
+                    Console.WriteLine($"File signature: {fileHex}");
+                    return 1;
                 }
+
+                foreach (var match in matches)
+                {
+                    Console.WriteLine(
+                        $"The file signature {match.Signature} matches the file {filePath} " +
+                        $"with description '{match.Description}' and extension '{match.Extension}'");
+                }
+                return 0;
             }
             catch (UnauthorizedAccessException ex)
             {
-                Console.WriteLine($"Access to the path is denied: {ex.Message}");
+                Console.Error.WriteLine($"Access to the path is denied: {ex.Message}");
+                return 1;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"An error occurred: {ex.Message}");
+                Console.Error.WriteLine($"An error occurred: {ex.Message}");
+                return 1;
             }
         }
 
-        static bool IsDocxFile(string filePath)
+        // Reads the start of the file and returns it as a lowercase hex string
+        // (two characters per byte). Files shorter than bytesToRead are fine.
+        static string ReadFileStartAsHex(string filePath, int bytesToRead)
+        {
+            byte[] buffer = new byte[bytesToRead];
+            using FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read);
+            int bytesRead = fs.Read(buffer, 0, buffer.Length);
+
+            StringBuilder hex = new StringBuilder(bytesRead * 2);
+            for (int i = 0; i < bytesRead; i++)
+            {
+                hex.AppendFormat("{0:x2}", buffer[i]);
+            }
+            return hex.ToString();
+        }
+
+        // Returns how many bytes from the start of a file the deepest valid
+        // signature could possibly need.
+        static int LargestOffsetPlusSignature(string jsonContent)
+        {
+            int largest = 64;
+            using JsonDocument document = JsonDocument.Parse(jsonContent);
+            foreach (JsonElement fileSig in document.RootElement.GetProperty("filesigs").EnumerateArray())
+            {
+                if (!int.TryParse(fileSig.GetProperty("Header offset").GetString(), out int offset))
+                {
+                    continue;
+                }
+                string signature = fileSig.GetProperty("Header (hex)").GetString()?.Replace(" ", "") ?? "";
+                largest = Math.Max(largest, offset + signature.Length / 2);
+            }
+            return largest;
+        }
+
+        // Returns every signature in the JSON that matches the file's hex string.
+        // For ZIP-based files, a deeper look inside the archive refines the answer.
+        static List<(string Description, string Extension, string Signature)> FindMatchingSignatures(
+            string jsonContent, string fileHex, string filePath)
+        {
+            List<(string Description, string Extension, string Signature)> matches = new();
+
+            using JsonDocument document = JsonDocument.Parse(jsonContent);
+            foreach (JsonElement fileSig in document.RootElement.GetProperty("filesigs").EnumerateArray())
+            {
+                if (!fileSig.TryGetProperty("Header (hex)", out JsonElement headerHexElement) ||
+                    !fileSig.TryGetProperty("Header offset", out JsonElement headerOffsetElement) ||
+                    !fileSig.TryGetProperty("File description", out JsonElement descriptionElement) ||
+                    !fileSig.TryGetProperty("File extension", out JsonElement extensionElement))
+                {
+                    continue;
+                }
+
+                string signature = headerHexElement.GetString()?.Replace(" ", "").ToLower() ?? string.Empty;
+                string description = descriptionElement.GetString() ?? "Unknown";
+                string extension = extensionElement.GetString() ?? "Unknown";
+
+                // Signatures with a non-numeric offset are skipped rather than
+                // silently matched at offset 0.
+                if (!int.TryParse(headerOffsetElement.GetString(), out int offset))
+                {
+                    continue;
+                }
+
+                int start = offset * 2;
+                if (string.IsNullOrEmpty(signature) || start + signature.Length > fileHex.Length)
+                {
+                    continue;
+                }
+
+                if (fileHex.Substring(start, signature.Length) == signature)
+                {
+                    matches.Add((description, extension, signature));
+                }
+            }
+
+            // Several formats share the ZIP signature (DOCX, XLSX, PPTX, APK, JAR...).
+            // Opening the archive tells us which one this really is, so we can
+            // report a single clear answer instead of every ZIP-based format.
+            if (matches.Any(m => m.Extension.Contains("ZIP")) && IsZipFile(filePath))
+            {
+                matches.Clear();
+                matches.Add(DescribeZipContent(filePath));
+            }
+
+            return matches;
+        }
+
+        // Returns true if the file opens as a valid ZIP archive.
+        static bool IsZipFile(string filePath)
         {
             try
             {
-                using (ZipArchive archive = ZipFile.OpenRead(filePath))
+                using ZipArchive archive = ZipFile.OpenRead(filePath);
+                return true;
+            }
+            catch (InvalidDataException)
+            {
+                return false;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+        }
+
+        // Looks inside a ZIP-based file and describes its actual content.
+        static (string Description, string Extension, string Signature) DescribeZipContent(string filePath)
+        {
+            using ZipArchive archive = ZipFile.OpenRead(filePath);
+
+            bool hasWordFolder = false;
+            bool hasExcelFolder = false;
+            bool hasPowerPointFolder = false;
+            bool hasAndroidManifest = false;
+
+            foreach (ZipArchiveEntry entry in archive.Entries)
+            {
+                if (entry.FullName.StartsWith("word/", StringComparison.OrdinalIgnoreCase))
                 {
-                    foreach (ZipArchiveEntry entry in archive.Entries)
-                    {
-                        if (entry.FullName.Equals("[Content_Types].xml", StringComparison.OrdinalIgnoreCase) ||
-                            entry.FullName.StartsWith("word/", StringComparison.OrdinalIgnoreCase))
-                        {
-                            return true;
-                        }
-                    }
+                    hasWordFolder = true;
+                }
+                else if (entry.FullName.StartsWith("xl/", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasExcelFolder = true;
+                }
+                else if (entry.FullName.StartsWith("ppt/", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasPowerPointFolder = true;
+                }
+                else if (entry.FullName.Equals("AndroidManifest.xml", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasAndroidManifest = true;
                 }
             }
-            catch
+
+            if (hasWordFolder)
             {
-                // Handle exceptions if the file is not a valid ZIP archive
+                return ("Microsoft Office Open XML Format document (Word)", "DOCX", "504b0304 + word/");
             }
-            return false;
+            if (hasExcelFolder)
+            {
+                return ("Microsoft Office Open XML Format spreadsheet", "XLSX", "504b0304 + xl/");
+            }
+            if (hasPowerPointFolder)
+            {
+                return ("Microsoft Office Open XML Format presentation", "PPTX", "504b0304 + ppt/");
+            }
+            if (hasAndroidManifest)
+            {
+                return ("Android package file", "APK", "504b0304 + AndroidManifest.xml");
+            }
+
+            return ("ZIP compressed archive file", "ZIP", "504b0304");
         }
     }
 }
